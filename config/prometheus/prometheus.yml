@@ -1,0 +1,19 @@
+# Prometheus: pilar de METRICAS del stack de observabilidad (los logs van a Loki).
+# Recoge cada 5 s las metricas del servidor objetivo (node-exporter que comparte
+# la red de servicio-academico): paquetes y bytes de red, CPU, memoria y carga.
+# Sirve para ver el IMPACTO de un ataque
+# (p. ej. el pico de paquetes recibidos por servicio-academico durante el DoS),
+# complementando las alertas de Suricata y de Packet Tracer que viven en Loki.
+global:
+  scrape_interval: 5s
+  evaluation_interval: 5s
+
+scrape_configs:
+  - job_name: servicio-academico
+    static_configs:
+      - targets: ["172.28.0.10:9100"]
+        labels:
+          servidor: "servicio-academico"
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]

@@ -1,0 +1,55 @@
+server:
+  http_listen_port: 9080
+  grpc_listen_port: 0
+
+positions:
+  filename: /tmp/positions.yaml
+
+clients:
+  - url: http://loki:3100/loki/api/v1/push
+
+scrape_configs:
+  - job_name: suricata-eve
+    static_configs:
+      - targets:
+          - localhost
+        labels:
+          job: suricata
+          __path__: /var/log/suricata/eve.json
+
+    pipeline_stages:
+      # eve.json ya viene en JSON, una línea por evento
+      - json:
+          expressions:
+            event_type: event_type
+            timestamp: timestamp
+            src_ip: src_ip
+            dest_ip: dest_ip
+            dest_port: dest_port
+            proto: proto
+            alert_signature: alert.signature
+            alert_category: alert.category
+            alert_severity: alert.severity
+
+      # nos quedamos solo con alertas (event_type == "alert"); el resto de eventos
+      # (flow, stats, etc.) se descarta para no llenar Loki de ruido
+      # (el motor regex de Go no soporta lookahead "(?!", por eso se usa un
+      #  match con filtro de linea LogQL y action: drop)
+      - match:
+          selector: '{job="suricata"} !~ "\"event_type\":\"alert\""'
+          action: drop
+          drop_counter_reason: no_es_alerta
+
+      # convertimos los campos extraídos en labels consultables desde Grafana/LogQL
+      - labels:
+          event_type:
+          alert_signature:
+          alert_category:
+          alert_severity:
+          src_ip:
+          dest_ip:
+
+      # usamos el timestamp real del evento de Suricata, no la hora en que Promtail lo leyó
+      - timestamp:
+          source: timestamp
+          format: RFC3339Nano

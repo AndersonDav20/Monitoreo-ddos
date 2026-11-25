@@ -1,0 +1,75 @@
+%YAML 1.1
+---
+# Configuracion minima de Suricata para el laboratorio de deteccion de ataques.
+# Escucha UNICAMENTE la interfaz de bridge "labnet0" (donde viven el atacante
+# y el objetivo), no la interfaz fisica de la VM, por eso network_mode: host
+# + esta interfaz explicita en vez de "eth0".
+
+vars:
+  address-groups:
+    HOME_NET: "[172.28.0.0/24]"
+    EXTERNAL_NET: "!$HOME_NET"
+    HTTP_SERVERS: "$HOME_NET"
+  port-groups:
+    HTTP_PORTS: "80"
+    SSH_PORTS: "22"
+
+default-log-dir: /var/log/suricata/
+
+af-packet:
+  - interface: labnet0
+    cluster-id: 99
+    cluster-type: cluster_flow
+    defrag: yes
+    # El sondeo de Prometheus al exporter del objetivo no es trafico de ataque
+    bpf-filter: "not port 9100"
+
+outputs:
+  - eve-log:
+      enabled: yes
+      filetype: regular
+      filename: eve.json
+      types:
+        - alert:
+            payload: no
+            metadata: yes
+        - http
+        - dns
+        - flow
+        - stats:
+            totals: yes
+            threads: no
+
+  - stats:
+      enabled: yes
+      filename: stats.log
+
+logging:
+  default-log-level: notice
+  outputs:
+    - console:
+        enabled: yes
+
+default-rule-path: /var/lib/suricata/rules
+rule-files:
+  - suricata.rules
+
+# Umbral simple para que un flujo de muchos paquetes cortos en poco tiempo
+# (hping3 flood) se marque como denegacion de servicio en vez de perderse
+# entre cientos de alertas individuales de "Possible DoS".
+threading:
+  set-cpu-affinity: no
+
+detect-engine:
+  - profile: medium
+  - sgh-mpm-context: auto
+  - inspection-recursion-limit: 3000
+
+app-layer:
+  protocols:
+    tls:
+      enabled: yes
+    http:
+      enabled: yes
+    dns:
+      enabled: yes

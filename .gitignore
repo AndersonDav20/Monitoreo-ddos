@@ -1,0 +1,26 @@
+# Credenciales - nunca se suben
+pat.txt
+.env
+
+# Datos/volumenes generados en tiempo de ejecucion
+*.log
+eve.json
+/suricata-logs/
+/loki-data/
+/grafana-data/
+
+# Sistema
+.DS_Store
+Thumbs.db
+
+# Python / Bun
+__pycache__/
+node_modules/
+
+# Salidas regenerables
+medicion/figuras/
+
+# Datos de medicion (se comparten aparte, no van al repositorio)
+medicion/resultados/
+*.csv
+*.xlsx

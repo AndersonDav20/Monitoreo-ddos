@@ -1,0 +1,185 @@
+# ---------------------------------------------------------------------------
+# Laboratorio de deteccion automatica de ataques (Suricata + Grafana/Loki/Promtail)
+#
+# Dos redes separadas a proposito:
+#   - lab-net:        donde viven el "atacante" y el "objetivo" (servicio-academico).
+#                      Docker crea para esta red una interfaz de bridge en el host
+#                      con nombre FIJO "labnet0" (ver driver_opts abajo), para que
+#                      Suricata pueda escucharla explicitamente en modo host.
+#   - monitoring-net:  donde viven loki, promtail y grafana. No necesita que
+#                      Suricata la vea; solo se usa para que esos tres servicios
+#                      se hablen entre si.
+#
+# Suricata corre en network_mode: host (ve todas las interfaces de la VM) pero su
+# af-packet (config/suricata/suricata.yaml) apunta especificamente a "labnet0", asi que
+# solo captura el trafico real que pasa entre el atacante y el objetivo.
+# ---------------------------------------------------------------------------
+
+networks:
+  lab-net:
+    driver: bridge
+    driver_opts:
+      com.docker.network.bridge.name: labnet0
+    ipam:
+      config:
+        - subnet: 172.28.0.0/24
+  monitoring-net:
+    driver: bridge
+
+volumes:
+  suricata-logs:
+  loki-data:
+  grafana-data:
+  prometheus-data:
+
+services:
+  # -------------------- objetivo (servicio escaneado / floodeado) --------------------
+  servicio-academico:
+    build: ./docker/servicio-academico
+    container_name: servicio-academico
+    networks:
+      lab-net:
+        ipv4_address: 172.28.0.10
+    restart: unless-stopped
+
+  # -------------------- atacante (nmap / hping3) --------------------
+  atacante:
+    build: ./docker/atacante
+    container_name: atacante
+    networks:
+      lab-net:
+        ipv4_address: 172.28.0.20
+      # El atacante tambien esta en monitoring-net SOLO para poder llamar a la
+      # API de anotaciones de Grafana (marca el inicio del ataque). El trafico
+      # del ataque en si (nmap/hping3 contra servicio-academico) sigue yendo
+      # unicamente por lab-net/labnet0, que es lo unico que Suricata observa.
+      monitoring-net: {}
+    cap_add:
+      - NET_RAW
+      - NET_ADMIN
+    environment:
+      GRAFANA_URL: http://grafana:3000
+      GRAFANA_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GRAFANA_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin123}
+      OBJETIVO_IP: 172.28.0.10
+    volumes:
+      - ./scripts/attack:/attack:ro
+    entrypoint: ["sleep", "infinity"]
+    restart: unless-stopped
+
+  # -------------------- Suricata (IDS que genera eve.json) --------------------
+  suricata:
+    image: jasonish/suricata:latest
+    container_name: suricata
+    network_mode: host
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+      - SYS_NICE
+    volumes:
+      - ./config/suricata/suricata.yaml:/etc/suricata/suricata.yaml:ro
+      - ./config/suricata/update-rules.sh:/update-rules.sh:ro
+      - suricata-logs:/var/log/suricata
+    entrypoint: ["/bin/sh", "-c", "/update-rules.sh && exec suricata -c /etc/suricata/suricata.yaml --af-packet -v"]
+    depends_on:
+      - servicio-academico
+      - atacante
+    restart: unless-stopped
+
+  # -------------------- Promtail (lee eve.json y lo manda a Loki) --------------------
+  promtail:
+    image: grafana/promtail:3.0.0
+    container_name: promtail
+    networks:
+      - monitoring-net
+    volumes:
+      - ./config/promtail/promtail-config.yml:/etc/promtail/config.yml:ro
+      - suricata-logs:/var/log/suricata:ro
+    command: -config.file=/etc/promtail/config.yml
+    depends_on:
+      - loki
+    restart: unless-stopped
+
+  # -------------------- Loki (almacena los logs) --------------------
+  loki:
+    image: grafana/loki:3.0.0
+    container_name: loki
+    networks:
+      - monitoring-net
+    ports:
+      - "3100:3100"
+    volumes:
+      - ./config/loki/loki-config.yml:/etc/loki/local-config.yaml:ro
+      - loki-data:/loki
+    command: -config.file=/etc/loki/local-config.yaml
+    healthcheck:
+      test: ["CMD-SHELL", "wget -q --spider http://localhost:3100/ready || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  # -------------------- Grafana (visualizacion) --------------------
+  grafana:
+    image: grafana/grafana:10.4.0
+    container_name: grafana
+    networks:
+      - monitoring-net
+    ports:
+      - "3000:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: ${GRAFANA_ADMIN_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:-admin123}
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      GF_USERS_DEFAULT_THEME: dark
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    depends_on:
+      - loki
+      - prometheus
+    restart: unless-stopped
+
+  # -------------------- exporter de metricas del objetivo --------------------
+  # node-exporter que COMPARTE la pila de red de servicio-academico
+  # (network_mode: service:...), asi sus metricas de red (paquetes/bytes por
+  # segundo en eth0) son exactamente el trafico que recibe la victima. La CPU,
+  # memoria y carga corresponden al entorno Linux donde corre Docker.
+  # (Se descarto cAdvisor: en Docker Desktop con almacenamiento containerd no
+  #  logra identificar los contenedores por nombre.)
+  exporter-objetivo:
+    image: prom/node-exporter:v1.8.2
+    container_name: exporter-objetivo
+    network_mode: "service:servicio-academico"
+    command:
+      - --collector.netdev.device-include=^eth0$
+      - --no-collector.wifi
+      - --no-collector.hwmon
+    depends_on:
+      - servicio-academico
+    restart: unless-stopped
+
+  # -------------------- Prometheus (almacena las metricas) --------------------
+  prometheus:
+    image: prom/prometheus:v2.53.2
+    container_name: prometheus
+    # Prometheus entra a lab-net solo para leer al exporter del objetivo
+    # (172.28.0.10:9100). Suricata excluye ese puerto con un filtro BPF
+    # ("not port 9100" en suricata.yaml) para que el sondeo no se mezcle
+    # con el trafico de ataque que se mide.
+    networks:
+      monitoring-net: {}
+      lab-net:
+        ipv4_address: 172.28.0.30
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    depends_on:
+      - exporter-objetivo
+    restart: unless-stopped
